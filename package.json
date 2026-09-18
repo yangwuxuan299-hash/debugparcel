@@ -2,6 +2,22 @@
   "name": "debugparcel",
   "version": "0.1.0",
   "private": true,
+  "description": "Create privacy-safe debug bundles from HAR files, console logs, and screenshots entirely in the browser.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yangwuxuan299-hash/debugparcel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yangwuxuan299-hash/debugparcel/issues"
+  },
+  "homepage": "https://debugparcel.wuxuanyang375.chatgpt.site",
+  "keywords": [
+    "har",
+    "redaction",
+    "privacy",
+    "debugging",
+    "support"
+  ],
   "engines": {
     "node": ">=22.13.0"
   },

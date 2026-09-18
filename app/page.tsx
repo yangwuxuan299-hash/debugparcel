@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   Archive,
   ArrowLeft,
@@ -9,7 +9,6 @@ import {
   CheckCircle2,
   CircleAlert,
   Download,
-  Eye,
   FileJson2,
   Image as ImageIcon,
   LockKeyhole,
@@ -23,8 +22,9 @@ import {
 } from "lucide-react";
 import { ScreenshotRedactor } from "@/components/screenshot-redactor";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Progress } from "@/components/ui/progress";
+import SanitizeWorker from "@/workers/sanitize.worker?worker";
 import {
+  auditSanitizedOutputs,
   findingsByCategory,
   scanDiagnostics,
   type Finding,
@@ -53,6 +53,11 @@ declare global {
 type Step = "import" | "review" | "mask" | "export";
 type FileKind = "har" | "console" | "screenshot";
 type FileSet = Partial<Record<FileKind, File>>;
+type PreviewKind = "har" | "console";
+
+const APP_VERSION = "0.1.1";
+const MAX_VISIBLE_FINDINGS = 250;
+const PREVIEW_LIMIT = 12_000;
 
 const steps: Array<{ id: Step; label: string }> = [
   { id: "import", label: "Import evidence" },
@@ -136,11 +141,84 @@ function formatBytes(bytes: number) {
 function detectKind(file: File): FileKind | null {
   const name = file.name.toLowerCase();
   if (name.endsWith(".har")) return "har";
-  if (file.type.startsWith("image/") || /\.(png|jpe?g|webp)$/.test(name)) return "screenshot";
+  if (
+    ["image/png", "image/jpeg", "image/webp"].includes(file.type) ||
+    /\.(png|jpe?g|webp)$/.test(name)
+  ) return "screenshot";
   if (/\.(json|txt|log)$/.test(name) || file.type.includes("json") || file.type.startsWith("text/")) {
     return "console";
   }
   return null;
+}
+
+async function hasSupportedImageSignature(file: File) {
+  const bytes = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  const isPng =
+    bytes.length >= 8 &&
+    [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every(
+      (value, index) => bytes[index] === value,
+    );
+  const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  const isWebp =
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" &&
+    String.fromCharCode(...bytes.slice(8, 12)) === "WEBP";
+  return isPng || isJpeg || isWebp;
+}
+
+function safeInlineCode(value: string) {
+  return value.replace(/[\r\n`]/g, "_");
+}
+
+function scanInWorker(input: {
+  harText?: string;
+  consoleText?: string;
+  customTerms?: string[];
+}, signal?: AbortSignal) {
+  if (signal?.aborted) return Promise.reject(new DOMException("Scan cancelled.", "AbortError"));
+  if (typeof Worker === "undefined") return Promise.resolve(scanDiagnostics(input));
+  return new Promise<ScanResult>((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new SanitizeWorker();
+    } catch {
+      resolve(scanDiagnostics(input));
+      return;
+    }
+    const id = Date.now();
+    let settled = false;
+    const timeout = window.setTimeout(() => {
+      if (!finish()) return;
+      reject(new Error("The local scan took too long. Try smaller diagnostic files."));
+    }, 60_000);
+    const finish = () => {
+      if (settled) return false;
+      settled = true;
+      window.clearTimeout(timeout);
+      signal?.removeEventListener("abort", handleAbort);
+      worker.terminate();
+      return true;
+    };
+    const handleAbort = () => {
+      if (!finish()) return;
+      reject(new DOMException("Scan cancelled.", "AbortError"));
+    };
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    worker.onmessage = (event: MessageEvent<
+      | { id: number; result: ScanResult }
+      | { id: number; error: string }
+    >) => {
+      if (event.data.id !== id) return;
+      if (!finish()) return;
+      if ("error" in event.data) reject(new Error(event.data.error));
+      else resolve(event.data.result);
+    };
+    worker.onerror = () => {
+      if (!finish()) return;
+      reject(new Error("The local privacy worker could not process these files."));
+    };
+    worker.postMessage({ id, input });
+  });
 }
 
 function dateSlug(date = new Date()) {
@@ -188,45 +266,73 @@ async function demoScreenshot() {
 
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const previousStepRef = useRef<Step>("import");
+  const scanGenerationRef = useRef(0);
+  const scanAbortRef = useRef<AbortController | null>(null);
   const [step, setStep] = useState<Step>("import");
   const [files, setFiles] = useState<FileSet>({});
   const [result, setResult] = useState<ScanResult | null>(null);
+  const [resultStale, setResultStale] = useState(false);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
   const [customTerms, setCustomTerms] = useState<string[]>([]);
   const [customInput, setCustomInput] = useState("");
+  const [previewKind, setPreviewKind] = useState<PreviewKind>("har");
   const [maskedScreenshot, setMaskedScreenshot] = useState<Blob | null>(null);
   const [maskCount, setMaskCount] = useState(0);
+  const [screenshotReviewed, setScreenshotReviewed] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [lastDownload, setLastDownload] = useState<{ blob: Blob; name: string; size: number } | null>(null);
 
   const scanFileSet = useCallback(async (nextFiles: FileSet, terms: string[]) => {
+    const generation = ++scanGenerationRef.current;
+    scanAbortRef.current?.abort();
+    const controller = new AbortController();
+    scanAbortRef.current = controller;
     setBusy(true);
+    setResultStale(true);
+    setConfirmed(false);
+    setLastDownload(null);
     setError("");
     try {
       const [harText, consoleText] = await Promise.all([
         nextFiles.har?.text(),
         nextFiles.console?.text(),
       ]);
-      await new Promise((resolve) => window.setTimeout(resolve, 180));
-      const nextResult = scanDiagnostics({ harText, consoleText, customTerms: terms });
+      const nextResult = await scanInWorker(
+        { harText, consoleText, customTerms: terms },
+        controller.signal,
+      );
+      if (generation !== scanGenerationRef.current) return;
       setResult(nextResult);
+      setResultStale(false);
+      setPreviewKind(nextResult.sanitizedHar ? "har" : "console");
       setConfirmed(false);
       setLastDownload(null);
       setStep("review");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The files could not be scanned.");
+      if (
+        generation === scanGenerationRef.current &&
+        !(reason instanceof DOMException && reason.name === "AbortError")
+      ) {
+        setError(reason instanceof Error ? reason.message : "The files could not be scanned.");
+      }
     } finally {
-      setBusy(false);
+      if (scanAbortRef.current === controller) scanAbortRef.current = null;
+      if (generation === scanGenerationRef.current) setBusy(false);
     }
   }, []);
 
   const loadDemo = useCallback(async () => {
+    const generation = ++scanGenerationRef.current;
+    scanAbortRef.current?.abort();
+    scanAbortRef.current = null;
     setBusy(true);
     setError("");
     try {
       const screenshot = await demoScreenshot();
+      if (generation !== scanGenerationRef.current) return;
       const nextFiles: FileSet = {
         har: new File([demoHar], "session.har", { type: "application/json" }),
         console: new File([demoConsole], "console.json", { type: "application/json" }),
@@ -237,8 +343,10 @@ export default function Home() {
       setMaskedScreenshot(null);
       await scanFileSet(nextFiles, []);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The demo could not be prepared.");
-      setBusy(false);
+      if (generation === scanGenerationRef.current) {
+        setError(reason instanceof Error ? reason.message : "The demo could not be prepared.");
+        setBusy(false);
+      }
     }
   }, [scanFileSet]);
 
@@ -272,7 +380,25 @@ export default function Home() {
     return () => lifecycle.abort();
   }, [loadDemo]);
 
-  const processFiles = (incoming: FileList | File[]) => {
+  useEffect(() => () => {
+    scanGenerationRef.current += 1;
+    scanAbortRef.current?.abort();
+  }, []);
+
+  useEffect(() => {
+    if (previousStepRef.current === step) return;
+    previousStepRef.current = step;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(`${step}-heading`)?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [step]);
+
+  const processFiles = async (incoming: FileList | File[]) => {
+    const generation = ++scanGenerationRef.current;
+    scanAbortRef.current?.abort();
+    scanAbortRef.current = null;
+    setBusy(false);
     const next = { ...files };
     let nextError = "";
     for (const file of Array.from(incoming)) {
@@ -286,30 +412,65 @@ export default function Home() {
         nextError = `${file.name} exceeds the ${kind === "screenshot" ? "12" : "50"} MB limit.`;
         continue;
       }
+      if (kind === "screenshot" && !(await hasSupportedImageSignature(file))) {
+        if (generation !== scanGenerationRef.current) return;
+        nextError = `${file.name} is not a valid PNG, JPEG, or WebP image.`;
+        continue;
+      }
+      const previousFile = next[kind];
       next[kind] = file;
+      const totalSize = Object.values(next).reduce((sum, item) => sum + (item?.size ?? 0), 0);
+      if (totalSize > 60 * 1024 ** 2) {
+        if (previousFile) next[kind] = previousFile;
+        else delete next[kind];
+        nextError = "The combined input exceeds the 60 MB browser-safety limit.";
+      }
     }
+    if (generation !== scanGenerationRef.current) return;
     setFiles(next);
     setResult(null);
+    setResultStale(false);
     setLastDownload(null);
     setMaskedScreenshot(null);
+    setMaskCount(0);
+    setScreenshotReviewed(false);
+    setConfirmed(false);
     setError(nextError);
   };
 
   const removeFile = (kind: FileKind) => {
+    scanGenerationRef.current += 1;
+    scanAbortRef.current?.abort();
+    scanAbortRef.current = null;
+    setBusy(false);
     const next = { ...files };
     delete next[kind];
     setFiles(next);
     setResult(null);
+    setResultStale(false);
     setLastDownload(null);
-    if (kind === "screenshot") setMaskedScreenshot(null);
+    setConfirmed(false);
+    if (kind === "screenshot") {
+      setMaskedScreenshot(null);
+      setMaskCount(0);
+      setScreenshotReviewed(false);
+    }
   };
 
   const addCustomTerm = async () => {
+    if (busy) return;
     const term = customInput.trim();
     if (!term || customTerms.includes(term)) return;
     const nextTerms = [...customTerms, term];
     setCustomTerms(nextTerms);
     setCustomInput("");
+    await scanFileSet(files, nextTerms);
+  };
+
+  const removeCustomTerm = async (index: number) => {
+    if (busy) return;
+    const nextTerms = customTerms.filter((_, termIndex) => termIndex !== index);
+    setCustomTerms(nextTerms);
     await scanFileSet(files, nextTerms);
   };
 
@@ -319,7 +480,28 @@ export default function Home() {
   );
   const occurrenceCount = result?.findings.reduce((sum, finding) => sum + finding.occurrences, 0) ?? 0;
   const fileCount = Object.keys(files).length;
-  const currentIndex = steps.findIndex((item) => item.id === step);
+  const visibleSteps = files.screenshot ? steps : steps.filter((item) => item.id !== "mask");
+  const currentIndex = visibleSteps.findIndex((item) => item.id === step);
+  const previews = result
+    ? [
+        ...(result.sanitizedHar ? [{ kind: "har" as const, label: "Network HAR", text: result.sanitizedHar }] : []),
+        ...(result.sanitizedConsole ? [{ kind: "console" as const, label: "Console", text: result.sanitizedConsole }] : []),
+      ]
+    : [];
+  const activePreview = previews.find((preview) => preview.kind === previewKind) ?? previews[0];
+  const handlePreviewTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? previews.length - 1
+        : (index + (event.key === "ArrowRight" ? 1 : -1) + previews.length) % previews.length;
+    const nextKind = previews[nextIndex]?.kind;
+    if (!nextKind) return;
+    setPreviewKind(nextKind);
+    window.requestAnimationFrame(() => document.getElementById(`preview-${nextKind}-tab`)?.focus());
+  };
 
   const buildReport = (scan: ScanResult) => {
     const failed = scan.requests.filter((request) => request.status >= 400);
@@ -327,7 +509,7 @@ export default function Home() {
       .map(([category, counts]) => `- ${findingLabel(category as Finding["category"])}: ${counts.entities} unique, ${counts.occurrences} occurrence(s)`)
       .join("\n") || "- No automatic matches";
     const requestLines = failed
-      .map((request) => `- \`${request.method} ${request.target}\` → **${request.status}**${request.duration !== null ? ` in ${request.duration} ms` : ""}`)
+      .map((request) => `- \`${safeInlineCode(request.method)} ${safeInlineCode(request.target)}\` → **${request.status}**${request.duration !== null ? ` in ${request.duration} ms` : ""}`)
       .join("\n") || "- No HTTP 4xx/5xx requests found";
     return `# Debug report
 
@@ -356,9 +538,9 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
   };
 
   const exportParcel = async () => {
-    if (!result || !confirmed || !result.auditPassed) return;
-    if (files.screenshot && !maskedScreenshot) {
-      setError("The screenshot is still being prepared. Wait a moment and try again.");
+    if (!result || !confirmed || !result.auditPassed || resultStale) return;
+    if (files.screenshot && (!maskedScreenshot || !screenshotReviewed)) {
+      setError("Review the redacted screenshot and confirm it before exporting.");
       return;
     }
     setBusy(true);
@@ -376,7 +558,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
       );
       const manifest = JSON.stringify({
         schemaVersion: 1,
-        tool: { name: "DebugParcel", version: "0.1.0" },
+        tool: { name: "DebugParcel", version: APP_VERSION },
         createdAt: new Date().toISOString(),
         privacy: {
           auditPassed: true,
@@ -388,6 +570,16 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
         },
         files: checksums,
       }, null, 2);
+      const finalAudit = auditSanitizedOutputs(
+        [
+          ...payloads.flatMap((item) => typeof item.data === "string" ? [item.data] : []),
+          manifest,
+        ],
+        result.findings,
+      );
+      if (!finalAudit.passed) {
+        throw new Error(`Final privacy audit blocked export: ${finalAudit.message}`);
+      }
       const zip = await makeZip([...payloads, { name: "manifest.json", data: manifest }]);
       const name = `debugparcel-${dateSlug()}.zip`;
       downloadBlob(zip, name);
@@ -399,8 +591,34 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
     }
   };
 
-  const handleMaskedChange = useCallback((blob: Blob | null) => setMaskedScreenshot(blob), []);
+  const handleMaskedChange = useCallback((blob: Blob | null) => {
+    setMaskedScreenshot(blob);
+    setScreenshotReviewed(false);
+    setConfirmed(false);
+    setLastDownload(null);
+  }, []);
   const handleMaskCount = useCallback((count: number) => setMaskCount(count), []);
+  const handleScreenshotError = useCallback((message: string) => setError(message), []);
+
+  const resetParcel = () => {
+    scanGenerationRef.current += 1;
+    scanAbortRef.current?.abort();
+    scanAbortRef.current = null;
+    setStep("import");
+    setFiles({});
+    setResult(null);
+    setResultStale(false);
+    setError("");
+    setCustomTerms([]);
+    setCustomInput("");
+    setPreviewKind("har");
+    setMaskedScreenshot(null);
+    setMaskCount(0);
+    setScreenshotReviewed(false);
+    setConfirmed(false);
+    setLastDownload(null);
+    if (inputRef.current) inputRef.current.value = "";
+  };
 
   return (
     <main className="min-h-screen bg-[var(--background)] text-[var(--foreground)]">
@@ -434,7 +652,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
             <div role="alert" className="mb-5 flex items-start gap-3 rounded-2xl border border-[#e0a6a1] bg-[#fff1ef] p-4 text-sm text-[#7c2520]">
               <CircleAlert className="mt-0.5 shrink-0" size={18} />
               <span className="flex-1">{error}</span>
-              <button type="button" onClick={() => setError("")} aria-label="Dismiss error"><X size={17} /></button>
+              <button type="button" className="icon-button shrink-0" onClick={() => setError("")} aria-label="Dismiss error"><X size={17} /></button>
             </div>
           )}
 
@@ -457,7 +675,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-5 py-4 sm:px-6">
                   <div>
                     <p className="eyebrow">01 / Import</p>
-                    <h2 id="import-heading" className="mt-1 font-display text-xl font-semibold tracking-tight">Add diagnostic files</h2>
+                    <h2 id="import-heading" tabIndex={-1} className="mt-1 font-display text-xl font-semibold tracking-tight outline-none focus-visible:ring-2 focus-visible:ring-[var(--ink)]">Add diagnostic files</h2>
                   </div>
                   <button type="button" className="secondary-button" onClick={() => void loadDemo()} disabled={busy}>
                     <Sparkles size={15} /> Try safe demo
@@ -467,13 +685,20 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                 <input
                   ref={inputRef}
                   className="sr-only"
-                  type="file"
-                  multiple
-                  accept=".har,.json,.txt,.log,.png,.jpg,.jpeg,.webp,application/json,text/plain,image/*"
-                  onChange={(event) => event.target.files && processFiles(event.target.files)}
+                type="file"
+                multiple
+                disabled={busy}
+                aria-label="Choose diagnostic files"
+                accept=".har,.json,.txt,.log,.png,.jpg,.jpeg,.webp,application/json,text/plain,image/png,image/jpeg,image/webp"
+                  onChange={(event) => {
+                    const selected = Array.from(event.currentTarget.files ?? []);
+                    event.currentTarget.value = "";
+                    if (selected.length) void processFiles(selected);
+                  }}
                 />
                 <button
                   type="button"
+                  disabled={busy}
                   className={`upload-zone group mx-5 my-5 w-[calc(100%-2.5rem)] sm:mx-6 sm:my-6 sm:w-[calc(100%-3rem)] ${dragging ? "is-dragging" : ""}`}
                   onClick={() => inputRef.current?.click()}
                   onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
@@ -482,7 +707,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                   onDrop={(event) => {
                     event.preventDefault();
                     setDragging(false);
-                    processFiles(event.dataTransfer.files);
+                    if (!busy) void processFiles(event.dataTransfer.files);
                   }}
                 >
                   <span className="grid size-12 place-items-center rounded-2xl border border-[var(--line)] bg-white shadow-sm transition-transform group-hover:-translate-y-0.5">
@@ -512,7 +737,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                             </p>
                           </div>
                           {file && (
-                            <button type="button" onClick={() => removeFile(kind)} className="icon-button" aria-label={`Remove ${meta.label}`}>
+                            <button type="button" onClick={() => removeFile(kind)} className="icon-button" aria-label={`Remove ${meta.label}`} disabled={busy}>
                               <Trash2 size={15} />
                             </button>
                           )}
@@ -536,7 +761,11 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                   {busy ? "Scanning locally…" : "Scan files"} <ArrowRight size={17} />
                 </button>
               </div>
-              {busy && <Progress value={62} className="mt-4 bg-[var(--soft)] [&>div]:bg-[var(--ink)]" aria-label="Scanning files" />}
+              {busy && (
+                <p role="status" className="mt-4 font-mono text-xs text-[var(--muted-strong)]">
+                  Reading and sanitizing locally…
+                </p>
+              )}
             </>
           )}
 
@@ -545,14 +774,14 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
               <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
                 <div>
                   <p className="eyebrow">02 / Review</p>
-                  <h1 id="review-heading" className="mt-2 font-display text-4xl font-semibold tracking-[-0.05em]">Privacy findings</h1>
+                  <h1 id="review-heading" tabIndex={-1} className="mt-2 font-display text-4xl font-semibold tracking-[-0.05em] outline-none focus-visible:ring-2 focus-visible:ring-[var(--ink)]">Privacy findings</h1>
                   <p className="mt-2 text-[var(--muted-strong)]">
                     {result.findings.length} unique values replaced across {occurrenceCount} locations.
                   </p>
                 </div>
-                <span className={`inline-flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-sm font-semibold ${result.auditPassed ? "bg-[#e0f7ca] text-[#21430d]" : "bg-[#fff1ef] text-[#7c2520]"}`}>
-                  {result.auditPassed ? <CheckCircle2 size={16} /> : <CircleAlert size={16} />}
-                  {result.auditPassed ? "Leak audit passed" : "Export blocked"}
+                <span className={`inline-flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-sm font-semibold ${result.auditPassed && !resultStale ? "bg-[#e0f7ca] text-[#21430d]" : "bg-[#fff1ef] text-[#7c2520]"}`}>
+                  {result.auditPassed && !resultStale ? <CheckCircle2 size={16} /> : <CircleAlert size={16} />}
+                  {resultStale ? (busy ? "Rescanning locally" : "Rescan required") : result.auditPassed ? "Leak audit passed" : "Export blocked"}
                 </span>
               </div>
 
@@ -574,9 +803,18 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                     <h2 className="mt-1 font-display text-xl font-semibold">Consistent aliases</h2>
                   </div>
                   <div className="max-h-[540px] overflow-y-auto">
-                    {result.findings.length ? result.findings.map((finding) => (
-                      <FindingRow key={finding.id} finding={finding} />
-                    )) : (
+                    {result.findings.length ? (
+                      <>
+                        {result.findings.slice(0, MAX_VISIBLE_FINDINGS).map((finding) => (
+                          <FindingRow key={finding.id} finding={finding} />
+                        ))}
+                        {result.findings.length > MAX_VISIBLE_FINDINGS && (
+                          <p className="border-t border-[var(--line)] bg-[var(--soft)] p-5 text-sm leading-6 text-[var(--muted-strong)]">
+                            Showing the first {MAX_VISIBLE_FINDINGS.toLocaleString()} values. Another {(result.findings.length - MAX_VISIBLE_FINDINGS).toLocaleString()} were redacted and are included in the summary counts.
+                          </p>
+                        )}
+                      </>
+                    ) : (
                       <div className="p-7 text-sm leading-6 text-[var(--muted-strong)]">
                         The automatic scan found no matching values. This is not a guarantee of safety; continue with a manual review.
                       </div>
@@ -589,9 +827,41 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                     <p className="eyebrow">Sanitized preview</p>
                     <h2 className="mt-1 font-display text-xl font-semibold">Safe output only</h2>
                   </div>
-                  <pre className="preview-code max-h-[390px] overflow-auto p-5" tabIndex={0}>
-                    {(result.sanitizedConsole || result.sanitizedHar || "No text evidence supplied.").slice(0, 12000)}
+                  {previews.length > 1 && (
+                    <div className="flex gap-1 border-b border-[var(--line)] bg-[var(--soft)] p-2" role="tablist" aria-label="Sanitized evidence">
+                      {previews.map((preview, index) => (
+                        <button
+                          key={preview.kind}
+                          id={`preview-${preview.kind}-tab`}
+                          type="button"
+                          role="tab"
+                          aria-selected={activePreview?.kind === preview.kind}
+                          aria-controls="sanitized-preview-panel"
+                          tabIndex={activePreview?.kind === preview.kind ? 0 : -1}
+                          onClick={() => setPreviewKind(preview.kind)}
+                          onKeyDown={(event) => handlePreviewTabKeyDown(event, index)}
+                          className={`min-h-11 rounded-xl px-3 text-sm font-semibold ${activePreview?.kind === preview.kind ? "bg-white shadow-sm" : "text-[var(--muted-strong)] hover:bg-white/70"}`}
+                        >
+                          {preview.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <pre
+                    id="sanitized-preview-panel"
+                    role="tabpanel"
+                    aria-labelledby={previews.length > 1 && activePreview ? `preview-${activePreview.kind}-tab` : undefined}
+                    aria-label={previews.length <= 1 ? activePreview?.label ?? "Sanitized preview" : undefined}
+                    className="preview-code max-h-[390px] overflow-auto p-5"
+                    tabIndex={0}
+                  >
+                    {(activePreview?.text ?? "No text evidence supplied.").slice(0, PREVIEW_LIMIT)}
                   </pre>
+                  {activePreview && activePreview.text.length > PREVIEW_LIMIT && (
+                    <p className="border-t border-[var(--line)] px-5 py-2 font-mono text-[11px] text-[var(--muted-strong)]">
+                      Preview truncated: showing {PREVIEW_LIMIT.toLocaleString()} of {activePreview.text.length.toLocaleString()} characters. The full sanitized file is included in the ZIP.
+                    </p>
+                  )}
                   <div className="border-t border-[var(--line)] p-5">
                     <label className="mb-2 block text-sm font-semibold" htmlFor="custom-redaction">Add a value the scan missed</label>
                     <div className="flex gap-2">
@@ -599,6 +869,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                         id="custom-redaction"
                         type="password"
                         value={customInput}
+                        disabled={busy}
                         onChange={(event) => setCustomInput(event.target.value)}
                         onKeyDown={(event) => { if (event.key === "Enter") void addCustomTerm(); }}
                         className="text-input min-w-0 flex-1"
@@ -609,6 +880,24 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                       </button>
                     </div>
                     <p className="mt-2 text-xs leading-5 text-[var(--muted-strong)]">The value stays in memory and is never written to the ZIP.</p>
+                    {customTerms.length > 0 && (
+                      <ul className="mt-3 flex flex-wrap gap-2" aria-label="Custom redaction rules">
+                        {customTerms.map((_, index) => (
+                          <li key={index} className="inline-flex min-h-11 items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--soft)] pl-3 pr-1 text-xs font-semibold">
+                            Custom rule {index + 1}
+                            <button
+                              type="button"
+                              className="grid size-11 place-items-center rounded-full hover:bg-white"
+                              aria-label={`Remove custom rule ${index + 1}`}
+                              onClick={() => void removeCustomTerm(index)}
+                              disabled={busy}
+                            >
+                              <X size={14} />
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 </section>
               </div>
@@ -617,18 +906,22 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                 <button type="button" className="secondary-button" onClick={() => setStep("import")}>
                   <ArrowLeft size={17} /> Back to files
                 </button>
-                <button type="button" className="primary-button" onClick={() => setStep(files.screenshot ? "mask" : "export")} disabled={!result.auditPassed}>
+                <button type="button" className="primary-button" onClick={() => setStep(files.screenshot ? "mask" : "export")} disabled={!result.auditPassed || resultStale || busy}>
                   {files.screenshot ? "Review screenshot" : "Prepare export"} <ArrowRight size={17} />
                 </button>
               </div>
             </section>
           )}
 
-          {step === "mask" && files.screenshot && result && (
-            <section aria-labelledby="mask-heading">
+          {files.screenshot && result && (
+            <section
+              aria-labelledby="mask-heading"
+              aria-hidden={step !== "mask"}
+              className={step === "mask" ? "" : "hidden"}
+            >
               <div className="mb-6">
                 <p className="eyebrow">03 / Mask</p>
-                <h1 id="mask-heading" className="mt-2 font-display text-4xl font-semibold tracking-[-0.05em]">Burn in screenshot masks</h1>
+                <h1 id="mask-heading" tabIndex={-1} className="mt-2 font-display text-4xl font-semibold tracking-[-0.05em] outline-none focus-visible:ring-2 focus-visible:ring-[var(--ink)]">Burn in screenshot masks</h1>
                 <p className="mt-2 max-w-2xl text-[var(--muted-strong)]">Drag to cover sensitive regions. Select a mask to move it; use Shift plus arrow keys to resize.</p>
               </div>
               <section className="work-card p-4 sm:p-5">
@@ -637,13 +930,25 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                   file={files.screenshot}
                   onChange={handleMaskedChange}
                   onMaskCount={handleMaskCount}
+                  onError={handleScreenshotError}
                 />
               </section>
+              <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-[var(--line)] bg-white p-4 text-sm leading-6">
+                <Checkbox
+                  checked={screenshotReviewed}
+                  onCheckedChange={(checked) => setScreenshotReviewed(checked === true)}
+                  disabled={!maskedScreenshot}
+                  className="mt-1"
+                />
+                <span>
+                  I inspected the whole screenshot and confirmed that every sensitive region is covered, or that no mask is needed.
+                </span>
+              </label>
               <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-between">
                 <button type="button" className="secondary-button" onClick={() => setStep("review")}>
                   <ArrowLeft size={17} /> Back to findings
                 </button>
-                <button type="button" className="primary-button" onClick={() => setStep("export")} disabled={!maskedScreenshot}>
+                <button type="button" className="primary-button" onClick={() => setStep("export")} disabled={!maskedScreenshot || !screenshotReviewed}>
                   Prepare export <ArrowRight size={17} />
                 </button>
               </div>
@@ -653,8 +958,8 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
           {step === "export" && result && (
             <section aria-labelledby="export-heading">
               <div className="mb-6">
-                <p className="eyebrow">04 / Export</p>
-                <h1 id="export-heading" className="mt-2 font-display text-4xl font-semibold tracking-[-0.05em]">Seal the parcel</h1>
+                <p className="eyebrow">{files.screenshot ? "04" : "03"} / Export</p>
+                <h1 id="export-heading" tabIndex={-1} className="mt-2 font-display text-4xl font-semibold tracking-[-0.05em] outline-none focus-visible:ring-2 focus-visible:ring-[var(--ink)]">Seal the parcel</h1>
                 <p className="mt-2 text-[var(--muted-strong)]">One issue-ready ZIP, with originals excluded.</p>
               </div>
 
@@ -684,7 +989,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                     </span>
                   </div>
                   <div className="mt-5 space-y-3 border-y border-white/10 py-5 text-sm text-white/76">
-                    <p className="flex items-center gap-2"><Check size={15} className="text-[var(--signal)]" /> Text leak audit passed</p>
+                    <p className="flex items-center gap-2"><Check size={15} className="text-[var(--signal)]" /> Final bundle leak audit enabled</p>
                     <p className="flex items-center gap-2"><Check size={15} className="text-[var(--signal)]" /> Original bodies excluded</p>
                     <p className="flex items-center gap-2"><Check size={15} className="text-[var(--signal)]" /> No reverse alias map</p>
                   </div>
@@ -696,16 +1001,21 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                     />
                     <span>I reviewed the sanitized preview and understand that automated detection may miss sensitive information.</span>
                   </label>
-                  <button type="button" className="export-button mt-5 w-full" onClick={() => void exportParcel()} disabled={!confirmed || busy || !result.auditPassed}>
+                  <button type="button" className="export-button mt-5 w-full" onClick={() => void exportParcel()} disabled={!confirmed || busy || !result.auditPassed || resultStale}>
                     <Download size={17} /> {busy ? "Building parcel…" : "Download ZIP"}
                   </button>
                   {lastDownload && (
                     <div className="mt-4 rounded-xl bg-white/[0.07] p-3 text-sm">
                       <p className="font-semibold text-[var(--signal)]">Parcel downloaded</p>
                       <p className="mt-1 truncate font-mono text-[11px] text-white/55">{lastDownload.name} · {formatBytes(lastDownload.size)}</p>
-                      <button type="button" className="mt-2 text-sm font-semibold underline decoration-white/30 underline-offset-4" onClick={() => downloadBlob(lastDownload.blob, lastDownload.name)}>
-                        Download again
-                      </button>
+                      <div className="mt-1 flex flex-wrap gap-x-4">
+                        <button type="button" className="inline-flex min-h-11 items-center text-sm font-semibold underline decoration-white/30 underline-offset-4" onClick={() => downloadBlob(lastDownload.blob, lastDownload.name)}>
+                          Download again
+                        </button>
+                        <button type="button" className="inline-flex min-h-11 items-center text-sm font-semibold underline decoration-white/30 underline-offset-4" onClick={resetParcel}>
+                          Start new parcel
+                        </button>
+                      </div>
                     </div>
                   )}
                 </section>
@@ -743,7 +1053,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
           <nav className="work-card p-5" aria-label="Parcel progress">
             <p className="eyebrow">Parcel progress</p>
             <ol className="mt-4 space-y-1">
-              {steps.map((item, index) => {
+              {visibleSteps.map((item, index) => {
                 const complete = index < currentIndex;
                 const active = item.id === step;
                 const canVisit = index <= currentIndex && (item.id === "import" || !!result);
@@ -753,6 +1063,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                       type="button"
                       disabled={!canVisit}
                       onClick={() => canVisit && setStep(item.id)}
+                      aria-current={active ? "step" : undefined}
                       className={`flex w-full items-center gap-3 rounded-xl px-2 py-2.5 text-left text-sm transition-colors ${active ? "bg-[var(--soft)]" : canVisit ? "hover:bg-[var(--soft)]" : ""}`}
                     >
                       <span className={`grid size-7 place-items-center rounded-full font-mono text-xs ${active ? "bg-[var(--ink)] text-white" : complete ? "bg-[var(--signal)] text-[var(--ink)]" : "bg-[var(--soft)] text-[var(--muted-strong)]"}`}>
@@ -767,6 +1078,12 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
           </nav>
         </aside>
       </div>
+      <footer className="mx-auto flex max-w-[1440px] flex-col gap-2 border-t border-[var(--line)] px-5 py-6 font-mono text-xs text-[var(--muted-strong)] sm:flex-row sm:items-center sm:justify-between lg:px-10">
+        <span>DebugParcel v{APP_VERSION} · local-only processing</span>
+        <a className="font-semibold underline decoration-[var(--line)] underline-offset-4 hover:text-[var(--foreground)]" href="https://github.com/yangwuxuan299-hash/debugparcel" target="_blank" rel="noreferrer">
+          Source, privacy model, and releases on GitHub
+        </a>
+      </footer>
       <div className="sr-only" aria-live="polite">{busy ? "Processing files locally" : lastDownload ? "Parcel export complete" : ""}</div>
     </main>
   );

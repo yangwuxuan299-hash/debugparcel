@@ -11,7 +11,8 @@ DebugParcel turns the evidence behind a web bug into a reviewable ZIP without up
 - Imports HAR files, console logs, and screenshots in the browser.
 - Replaces matching values with consistent aliases across text artifacts.
 - Detects authorization headers, cookies, API keys, JWTs, emails, IP addresses, internal hosts, user IDs, and local paths.
-- Omits request and response bodies by default.
+- Omits request and response bodies, including multipart parameters, by default.
+- Sanitizes structured HAR query and cookie fields before producing request summaries.
 - Lets the reporter burn permanent masks into screenshot pixels.
 - Runs a final leak audit before export.
 - Produces an issue-ready ZIP with a Markdown report, sanitized evidence, and SHA-256 checksums.
@@ -45,6 +46,8 @@ Then open the local URL printed by the development server. Use **Try safe demo**
 For a production check:
 
 ```bash
+npm run lint
+npm test
 npm run typecheck
 npm run build
 ```
@@ -56,6 +59,7 @@ DebugParcel is deliberately conservative:
 - Request and response body text is replaced with omission markers.
 - Screenshot masking uses opaque pixels rather than reversible blur.
 - Export is blocked when a discovered source value survives the text audit.
+- The final report and manifest pass through the same leak audit before ZIP creation.
 - Raw values, bundle secrets, and reverse mappings are never written to the output.
 - No data is stored in cookies, local storage, or a database.
 
@@ -64,15 +68,19 @@ Automated detection cannot guarantee that every sensitive value will be found. R
 ## Limitations
 
 - Screenshot detection is manual; OCR is not part of v0.1.
-- Very large inputs are capped at 50 MB for text artifacts and 12 MB for screenshots.
+- Very large inputs are capped at 50 MB per text artifact, 12 MB per screenshot, and 60 MB combined.
 - Console files are treated as JSON when valid and as plain text otherwise.
 - Redaction prioritizes safe output over preserving request or response bodies.
+
+## v0.1.1 hardening
+
+This release closes HAR path, cookie, query, multipart, JSON-key, and serialized-string audit gaps; adds regression fixtures; moves text scanning into a Web Worker; validates screenshot signatures and decoded dimensions; improves touch and keyboard masking; and makes both sanitized text artifacts reviewable before export.
 
 ## Roadmap
 
 - Optional browser extension capture
 - Rule packs for common SaaS and cloud credentials
-- Worker-based parsing for very large HAR files
+- Streaming parsing for traces larger than the current browser-safety limits
 - Importable organization policies
 - Reproducible CLI mode for CI and support tooling
 

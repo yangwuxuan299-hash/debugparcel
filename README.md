@@ -76,6 +76,10 @@ Automated detection cannot guarantee that every sensitive value will be found. R
 
 This release closes HAR path, cookie, query, multipart, JSON-key, and serialized-string audit gaps; adds regression fixtures; moves text scanning into a Web Worker; validates screenshot signatures and decoded dimensions; improves touch and keyboard masking; and makes both sanitized text artifacts reviewable before export.
 
+## v0.1.2 deployment hardening
+
+This patch applies the privacy-focused Content Security Policy and related browser security headers through both the request proxy and static asset rules so they cover the hosted Worker, its browser worker, and local production builds.
+
 ## Roadmap
 
 - Optional browser extension capture

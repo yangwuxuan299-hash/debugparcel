@@ -55,7 +55,7 @@ type FileKind = "har" | "console" | "screenshot";
 type FileSet = Partial<Record<FileKind, File>>;
 type PreviewKind = "har" | "console";
 
-const APP_VERSION = "0.1.3";
+const APP_VERSION = "0.1.4";
 const MAX_VISIBLE_FINDINGS = 250;
 const PREVIEW_LIMIT = 12_000;
 

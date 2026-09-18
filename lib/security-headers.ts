@@ -1,3 +1,16 @@
+export const ROUTED_ASSET_PREFIX = "/__debugparcel_assets";
+
+const NEXT_STATIC_PREFIX = "/_next/static/";
+const ROUTED_STATIC_PREFIX = `${ROUTED_ASSET_PREFIX}${NEXT_STATIC_PREFIX}`;
+
+export function staticAssetStoragePath(pathname: string) {
+  if (pathname.startsWith(NEXT_STATIC_PREFIX)) return pathname;
+  if (pathname.startsWith(ROUTED_STATIC_PREFIX)) {
+    return pathname.slice(ROUTED_ASSET_PREFIX.length);
+  }
+  return null;
+}
+
 export const SECURITY_HEADERS = {
   "Content-Security-Policy":
     "default-src 'self'; connect-src 'self'; img-src 'self' blob: data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; worker-src 'self' blob:",
@@ -13,7 +26,7 @@ export const IMMUTABLE_ASSET_CACHE =
 
 export function isStaticAssetRead(pathname: string, method: string) {
   return (
-    pathname.startsWith("/_next/static/") &&
+    staticAssetStoragePath(pathname) !== null &&
     (method === "GET" || method === "HEAD")
   );
 }

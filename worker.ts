@@ -4,6 +4,7 @@ import {
   isCacheableStaticAssetResponse,
   isStaticAssetRead,
   SECURITY_HEADERS,
+  staticAssetStoragePath,
 } from "@/lib/security-headers";
 
 interface WorkerEnv extends Cloudflare.Env {
@@ -13,11 +14,17 @@ interface WorkerEnv extends Cloudflare.Env {
 export default {
   async fetch(request, env, context) {
     const pathname = new URL(request.url).pathname;
+    const assetStoragePath = staticAssetStoragePath(pathname);
     const isAssetRead = isStaticAssetRead(pathname, request.method);
-    const response =
-      isAssetRead && env.ASSETS
-        ? await env.ASSETS.fetch(request)
-        : await vinextHandler.fetch(request, env, context);
+    let response: Response;
+
+    if (isAssetRead && assetStoragePath && env.ASSETS) {
+      const assetUrl = new URL(request.url);
+      assetUrl.pathname = assetStoragePath;
+      response = await env.ASSETS.fetch(new Request(assetUrl, request));
+    } else {
+      response = await vinextHandler.fetch(request, env, context);
+    }
     const headers = new Headers(response.headers);
 
     for (const [name, value] of Object.entries(SECURITY_HEADERS)) {

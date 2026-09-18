@@ -29,12 +29,21 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-export function sites({ mockAuth = true } = {}): Plugin {
+interface SitesPluginOptions {
+  mockAuth?: boolean;
+  routedAssetPrefix?: string;
+}
+
+export function sites({
+  mockAuth = true,
+  routedAssetPrefix,
+}: SitesPluginOptions = {}): Plugin {
   let root = process.cwd();
   let command: "build" | "serve" = "build";
 
   return {
     name: "sites",
+    enforce: "post",
     configResolved(config) {
       root = config.root;
       command = config.command;
@@ -170,22 +179,59 @@ export function sites({ mockAuth = true } = {}): Plugin {
         response.end();
       });
     },
-    async closeBundle() {
-      if (command !== "build") return;
+    closeBundle: {
+      order: "post",
+      sequential: true,
+      async handler() {
+        if (command !== "build") return;
 
-      const outputDirectory = resolve(root, "dist", ".openai");
-      const hostingConfig = resolve(root, ".openai", "hosting.json");
-      const drizzleSource = resolve(root, "drizzle");
+        const outputDirectory = resolve(root, "dist", ".openai");
+        const hostingConfig = resolve(root, ".openai", "hosting.json");
+        const drizzleSource = resolve(root, "drizzle");
 
-      await rm(outputDirectory, { recursive: true, force: true });
-      await mkdir(outputDirectory, { recursive: true });
+        await rm(outputDirectory, { recursive: true, force: true });
+        await mkdir(outputDirectory, { recursive: true });
 
-      await cp(hostingConfig, resolve(outputDirectory, "hosting.json"));
-      if (await exists(drizzleSource)) {
-        await cp(drizzleSource, resolve(outputDirectory, "drizzle"), {
-          recursive: true,
-        });
-      }
+        await cp(hostingConfig, resolve(outputDirectory, "hosting.json"));
+        if (await exists(drizzleSource)) {
+          await cp(drizzleSource, resolve(outputDirectory, "drizzle"), {
+            recursive: true,
+          });
+        }
+
+        if (routedAssetPrefix && this.environment.name === "client") {
+          const relativePrefix = routedAssetPrefix.replace(/^\/+|\/+$/g, "");
+          if (!relativePrefix || relativePrefix.split("/").includes("..")) {
+            throw new Error("routedAssetPrefix must be a safe non-root path.");
+          }
+
+          const clientDirectory = resolve(root, "dist", "client");
+          const routedDirectory = resolve(clientDirectory, relativePrefix);
+          const routedStaticDirectory = resolve(
+            routedDirectory,
+            "_next",
+            "static",
+          );
+          const canonicalStaticDirectory = resolve(
+            clientDirectory,
+            "_next",
+            "static",
+          );
+
+          if (!(await exists(routedStaticDirectory))) {
+            throw new Error(
+              `Expected routed assets at ${routedStaticDirectory}, but the directory was not built.`,
+            );
+          }
+
+          await rm(canonicalStaticDirectory, { recursive: true, force: true });
+          await cp(routedStaticDirectory, canonicalStaticDirectory, {
+            recursive: true,
+          });
+          await rm(routedDirectory, { recursive: true, force: true });
+          await rm(resolve(clientDirectory, "_headers"), { force: true });
+        }
+      },
     },
   };
 }

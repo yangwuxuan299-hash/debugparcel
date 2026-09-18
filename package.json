@@ -1,6 +1,6 @@
 {
   "name": "debugparcel",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Create privacy-safe debug bundles from HAR files, console logs, and screenshots entirely in the browser.",
   "repository": {

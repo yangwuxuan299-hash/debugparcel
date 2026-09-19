@@ -14,10 +14,23 @@ if (managedLinux && command === "build") {
   process.exit(result.status ?? 1);
 }
 
-// Import in this process so the preview owner retains its PID and signals.
 const cli = new URL(managedLinux
   ? "../node_modules/vite/bin/vite.js"
   : "../node_modules/vinext/dist/cli.js", import.meta.url);
-process.argv = [process.execPath, fileURLToPath(cli), command,
-  ...(!managedLinux && command === "dev" ? ["--port", "5173"] : []), ...args];
-await import(cli.href);
+if (command === "build") {
+  const result = spawnSync(process.execPath, [fileURLToPath(cli), command, ...args], {
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) process.exit(result.status ?? 1);
+  const { verifyBuildOutput } = await import("./verify-build-output.mjs");
+  const summary = await verifyBuildOutput();
+  console.log(
+    `Verified DebugParcel v${summary.version} build output: ${summary.routedOutputs} routed outputs, ${summary.canonicalFiles} canonical files.`,
+  );
+} else {
+  // Import dev in this process so the preview owner retains its PID and signals.
+  process.argv = [process.execPath, fileURLToPath(cli), command,
+    ...(!managedLinux ? ["--port", "5173"] : []), ...args];
+  await import(cli.href);
+}

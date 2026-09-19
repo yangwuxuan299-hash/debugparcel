@@ -437,10 +437,6 @@ function sanitizeString(input: string, registry: Registry, location: string) {
   return output;
 }
 
-function cloneValue<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
-}
-
 function nextUniqueKey(output: Record<string, unknown>, preferred: string) {
   if (!Object.prototype.hasOwnProperty.call(output, preferred)) return preferred;
   let suffix = 2;
@@ -590,6 +586,95 @@ function firstMultiLiteralMatch<T>(inputs: string[], values: Map<string, T>) {
   return undefined;
 }
 
+const aliasTokenPattern = /\[(?:AUTH|API_KEY|COOKIE|EMAIL|HOST|IP|PATH|PRIVATE_KEY|QUERY|SECRET|SESSION|USER_ID)_\d+\]|%5B(?:AUTH|API_KEY|COOKIE|EMAIL|HOST|IP|PATH|PRIVATE_KEY|QUERY|SECRET|SESSION|USER_ID)_\d+%5D/gi;
+const percentEncoder = new TextEncoder();
+
+function percentBytePattern(byte: number) {
+  return byte
+    .toString(16)
+    .padStart(2, "0")
+    .split("")
+    .map((digit) => /[a-f]/.test(digit) ? `[${digit}${digit.toUpperCase()}]` : digit)
+    .join("");
+}
+
+function percentAwareLiteralPattern(value: string) {
+  return [...value].map((character) => {
+    const encodedAtDepth = (depth: number, source = character) =>
+      [...percentEncoder.encode(source)]
+        .map((byte) => `%${"25".repeat(depth - 1)}${percentBytePattern(byte)}`)
+        .join("");
+    const alternatives = [escapeRegExp(character)];
+    for (let depth = 1; depth <= 3; depth += 1) {
+      alternatives.push(encodedAtDepth(depth));
+    }
+    if (character === " ") {
+      alternatives.push("\\+");
+      for (let depth = 1; depth <= 3; depth += 1) {
+        alternatives.push(encodedAtDepth(depth, "+"));
+      }
+    }
+    return `(?:${alternatives.join("|")})`;
+  }).join("");
+}
+
+function normalizedAlias(token: string) {
+  if (!token.startsWith("%")) return token;
+  try {
+    return decodeURIComponent(token);
+  } catch {
+    return token;
+  }
+}
+
+function replaceOutsideGeneratedAliases(
+  input: string,
+  isGeneratedAlias: (value: string) => boolean,
+  replaceSegment: (value: string) => string,
+) {
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const match of input.matchAll(aliasTokenPattern)) {
+    if (!isGeneratedAlias(normalizedAlias(match[0]))) continue;
+    const index = match.index ?? 0;
+    parts.push(replaceSegment(input.slice(cursor, index)), match[0]);
+    cursor = index + match[0].length;
+  }
+  parts.push(replaceSegment(input.slice(cursor)));
+  return parts.join("");
+}
+
+function decodePercentRuns(value: string, formEncoded = false) {
+  const source = formEncoded ? value.replaceAll("+", " ") : value;
+  return source.replace(/(?:%[0-9a-f]{2})+/gi, (run) => {
+    try {
+      return decodeURIComponent(run);
+    } catch {
+      return run;
+    }
+  });
+}
+
+function auditProjections(value: string) {
+  const projections = [value];
+  let frontier = [value];
+  for (let pass = 0; pass < 4 && frontier.length; pass += 1) {
+    const next: string[] = [];
+    for (const candidate of frontier) {
+      for (const decoded of [
+        decodePercentRuns(candidate),
+        decodePercentRuns(candidate, true),
+      ]) {
+        if (decoded === candidate || projections.includes(decoded)) continue;
+        projections.push(decoded);
+        next.push(decoded);
+      }
+    }
+    frontier = next;
+  }
+  return projections;
+}
+
 export function auditSanitizedOutputs(
   outputs: string[],
   findings: Array<Pick<Finding, "alias" | "category" | "raw">>,
@@ -635,10 +720,10 @@ export function auditSanitizedOutputs(
       const values: string[] = [];
       const keys: string[] = [];
       collectJsonAuditStrings(JSON.parse(output) as unknown, values, keys);
-      structuredValues.push(...values.map(stripAliases));
-      structuredKeys.push(...keys.map(stripAliases));
+      structuredValues.push(...values.flatMap((value) => auditProjections(stripAliases(value))));
+      structuredKeys.push(...keys.flatMap((value) => auditProjections(stripAliases(value))));
     } catch {
-      plainOutputs.push(stripAliases(output));
+      plainOutputs.push(...auditProjections(stripAliases(output)));
     }
   }
 
@@ -946,7 +1031,12 @@ function replaceCustomTerm(
 ): unknown {
   if (depth > 64) throw new Error("Input nesting is too deep to process safely.");
   if (typeof value === "string") {
-    return value.replaceAll(term, () => registry.alias("SECRET", term, path));
+    const pattern = new RegExp(percentAwareLiteralPattern(term), "g");
+    return replaceOutsideGeneratedAliases(
+      value,
+      (candidate) => registry.isAlias(candidate),
+      (segment) => segment.replace(pattern, () => registry.alias("SECRET", term, path)),
+    );
   }
   if (typeof value === "number" && Number.isFinite(value) && String(value) === term) {
     return registry.alias("SECRET", term, path);
@@ -961,11 +1051,40 @@ function replaceCustomTerm(
   const output = Object.create(null) as Record<string, unknown>;
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
     const keyPath = `${path}.[key]`;
-    const replacedKey = key.replaceAll(term, () => registry.alias("SECRET", term, keyPath));
+    const pattern = new RegExp(percentAwareLiteralPattern(term), "g");
+    const replacedKey = replaceOutsideGeneratedAliases(
+      key,
+      (candidate) => registry.isAlias(candidate),
+      (segment) => segment.replace(pattern, () => registry.alias("SECRET", term, keyPath)),
+    );
     const outputKey = nextUniqueKey(output, replacedKey);
     output[outputKey] = replaceCustomTerm(child, term, registry, `${path}.${outputKey}`, depth + 1);
   }
   return output;
+}
+
+function looksLikeHar(value: unknown) {
+  const root = asRecord(value);
+  const log = asRecord(root?.log);
+  return Boolean(log && Object.prototype.hasOwnProperty.call(log, "entries"));
+}
+
+function harEnvelope(value: unknown) {
+  const root = asRecord(value);
+  const log = asRecord(root?.log);
+  if (!log || typeof log.version !== "string" || !Array.isArray(log.entries)) return null;
+  return { entries: log.entries };
+}
+
+function assertValidHar(value: unknown) {
+  const envelope = harEnvelope(value);
+  if (!envelope) throw new Error("The network archive is not a valid HAR document.");
+  for (const entry of envelope.entries) {
+    const record = asRecord(entry);
+    if (!record || !asRecord(record.request) || !asRecord(record.response)) {
+      throw new Error("The network archive contains an invalid HAR entry.");
+    }
+  }
 }
 
 function requestTarget(url: string) {
@@ -1054,16 +1173,20 @@ export function scanDiagnostics({
     } catch {
       throw new Error("The HAR file is not valid JSON.");
     }
-    const cloned = cloneValue(parsed);
-    omittedBodies += prepareHar(cloned, registry);
-    const sanitized = sanitizeNode(cloned, registry, "har");
+    assertValidHar(parsed);
+    omittedBodies += prepareHar(parsed, registry);
+    const sanitized = sanitizeNode(parsed, registry, "har");
     sanitizedHar = JSON.stringify(sanitized, null, 2);
   }
 
   if (consoleText) {
     let sanitized: unknown;
     try {
-      sanitized = sanitizeNode(JSON.parse(consoleText), registry, "console");
+      const parsed = JSON.parse(consoleText) as unknown;
+      if (looksLikeHar(parsed)) {
+        throw new Error("This JSON looks like a HAR archive. Import it as a .har file so request and response bodies are safely omitted.");
+      }
+      sanitized = sanitizeNode(parsed, registry, "console");
       sanitizedConsole = JSON.stringify(sanitized, null, 2);
       consoleIsJson = true;
     } catch (error) {
@@ -1122,10 +1245,12 @@ export function scanDiagnostics({
           2,
         );
       } else {
-        sanitizedConsole = sanitizedConsole.replaceAll(
+        sanitizedConsole = replaceCustomTerm(
+          sanitizedConsole,
           term,
-          () => registry.alias("SECRET", term, "console.custom"),
-        );
+          registry,
+          "console.custom",
+        ) as string;
       }
     }
   }

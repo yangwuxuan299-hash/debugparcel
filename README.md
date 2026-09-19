@@ -70,7 +70,12 @@ Automated detection cannot guarantee that every sensitive value will be found. R
 - Screenshot detection is manual; OCR is not part of v0.1.
 - Very large inputs are capped at 50 MB per text artifact, 12 MB per screenshot, and 60 MB combined.
 - Console files are treated as JSON when valid and as plain text otherwise.
+- JSON with a HAR envelope is rejected from the console slot and must be imported as a network archive.
 - Redaction prioritizes safe output over preserving request or response bodies.
+
+## v0.1.5 review and import hardening
+
+This release rejects mislabeled or malformed HAR data before export, detects percent-encoded copies of known values during the final privacy audit, makes custom rules encoding-aware without corrupting generated aliases, and removes a redundant full HAR clone. Truncated previews can now be downloaded in full for local review, every in-progress parcel can be cleared immediately, muted text meets AA contrast, and builds verify the hosted artifact contract before publication.
 
 ## v0.1.1 hardening
 

@@ -55,7 +55,7 @@ type FileKind = "har" | "console" | "screenshot";
 type FileSet = Partial<Record<FileKind, File>>;
 type PreviewKind = "har" | "console";
 
-const APP_VERSION = "0.1.4";
+const APP_VERSION = "0.1.5";
 const MAX_VISIBLE_FINDINGS = 250;
 const PREVIEW_LIMIT = 12_000;
 
@@ -140,7 +140,7 @@ function formatBytes(bytes: number) {
 
 function detectKind(file: File): FileKind | null {
   const name = file.name.toLowerCase();
-  if (name.endsWith(".har")) return "har";
+  if (name.endsWith(".har") || name.endsWith(".har.json") || file.type === "application/har+json") return "har";
   if (
     ["image/png", "image/jpeg", "image/webp"].includes(file.type) ||
     /\.(png|jpe?g|webp)$/.test(name)
@@ -503,6 +503,17 @@ export default function Home() {
     window.requestAnimationFrame(() => document.getElementById(`preview-${nextKind}-tab`)?.focus());
   };
 
+  const downloadActivePreview = () => {
+    if (!activePreview || !result?.auditPassed || resultStale || busy) return;
+    const filename = activePreview.kind === "har"
+      ? "network.sanitized.har"
+      : "console.sanitized.json";
+    downloadBlob(
+      new Blob([activePreview.text], { type: "application/json;charset=utf-8" }),
+      filename,
+    );
+  };
+
   const buildReport = (scan: ScanResult) => {
     const failed = scan.requests.filter((request) => request.status >= 400);
     const categoryLines = Object.entries(findingsByCategory(scan.findings))
@@ -620,6 +631,12 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
     if (inputRef.current) inputRef.current.value = "";
   };
 
+  const confirmResetParcel = () => {
+    if (window.confirm("Clear this parcel and remove its files, findings, masks, and export data from this tab?")) {
+      resetParcel();
+    }
+  };
+
   return (
     <main className="min-h-screen bg-[var(--background)] text-[var(--foreground)]">
       <header className="border-b border-white/10 bg-[var(--ink)] text-white">
@@ -689,7 +706,7 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                 multiple
                 disabled={busy}
                 aria-label="Choose diagnostic files"
-                accept=".har,.json,.txt,.log,.png,.jpg,.jpeg,.webp,application/json,text/plain,image/png,image/jpeg,image/webp"
+                accept=".har,.har.json,.json,.txt,.log,.png,.jpg,.jpeg,.webp,application/har+json,application/json,text/plain,image/png,image/jpeg,image/webp"
                   onChange={(event) => {
                     const selected = Array.from(event.currentTarget.files ?? []);
                     event.currentTarget.value = "";
@@ -858,9 +875,19 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
                     {(activePreview?.text ?? "No text evidence supplied.").slice(0, PREVIEW_LIMIT)}
                   </pre>
                   {activePreview && activePreview.text.length > PREVIEW_LIMIT && (
-                    <p className="border-t border-[var(--line)] px-5 py-2 font-mono text-[11px] text-[var(--muted-strong)]">
-                      Preview truncated: showing {PREVIEW_LIMIT.toLocaleString()} of {activePreview.text.length.toLocaleString()} characters. The full sanitized file is included in the ZIP.
-                    </p>
+                    <div className="border-t border-[var(--line)] px-5 py-3">
+                      <p className="font-mono text-[11px] leading-5 text-[var(--muted-strong)]">
+                        Preview truncated: showing {PREVIEW_LIMIT.toLocaleString()} of {activePreview.text.length.toLocaleString()} characters. Inspect the full sanitized file before confirming export.
+                      </p>
+                      <button
+                        type="button"
+                        className="secondary-button mt-2"
+                        onClick={downloadActivePreview}
+                        disabled={busy || resultStale || !result.auditPassed}
+                      >
+                        <Download size={15} /> Download full sanitized file
+                      </button>
+                    </div>
                   )}
                   <div className="border-t border-[var(--line)] p-5">
                     <label className="mb-2 block text-sm font-semibold" htmlFor="custom-redaction">Add a value the scan missed</label>
@@ -1076,6 +1103,21 @@ ${files.screenshot ? "- `screenshot.redacted.png`" : ""}
               })}
             </ol>
           </nav>
+          {fileCount > 0 && (
+            <div>
+              <button
+                type="button"
+                className="secondary-button w-full"
+                onClick={confirmResetParcel}
+                disabled={busy}
+              >
+                <Trash2 size={15} /> Clear local data
+              </button>
+              <p className="mt-2 text-center text-xs leading-5 text-[var(--muted-strong)]">
+                Removes originals, findings, masks, and generated exports from this tab.
+              </p>
+            </div>
+          )}
         </aside>
       </div>
       <footer className="mx-auto flex max-w-[1440px] flex-col gap-2 border-t border-[var(--line)] px-5 py-6 font-mono text-xs text-[var(--muted-strong)] sm:flex-row sm:items-center sm:justify-between lg:px-10">
